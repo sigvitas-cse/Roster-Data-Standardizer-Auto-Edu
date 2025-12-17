@@ -1,3 +1,11 @@
+#!/usr/bin/env python3
+"""
+education_extraction_batch_final.py
+
+Robust structured education extraction for people in input_data.xlsx using google.genai
+with GoogleSearch tool. Uses PROMPT-BASED JSON OUTPUT with Dynamic Key Failover.
+"""
+
 import os
 import re
 import time
@@ -11,7 +19,7 @@ import requests
 from google import genai
 from google.genai import types
 
-# ---------------- CONFIG ----------------
+# ---------------- GLOBAL COUNTERS AND CONFIG ----------------
 INPUT_FILE = "input_data.xlsx"
 OUTPUT_FILE = "education_output.csv"
 MANUAL_REVIEW_FILE = "manual_review.csv"
@@ -19,12 +27,14 @@ RESOLVED_URLS_FILE = "resolved_urls.csv"
 LOG_FILE = "education_extraction_batch.log"
 
 MODEL = "gemini-2.5-flash"
-SLEEP_SECONDS = 15      # Time to wait BETWEEN BATCHES (to respect RPM limit)
+SLEEP_SECONDS = 15      
 RETRY_ATTEMPTS = 3
-DAILY_LIMIT = 200       # Max Requests Per Day (Set high to allow many keys to run)
-BATCH_SIZE = 10         # Max rows per request (Reduced for JSON stability)
-TEST_COUNT = None       # change to None to run all rows
+DAILY_LIMIT = 200       
+BATCH_SIZE = 10         
 
+# --- JSON FAILURE SKIP MECHANISM (Initialized here, values set in main) ---
+MAX_JSON_FAILURES = 10 
+JSON_SKIP_ATTEMPTS = 0
 # ----------------------------------------
 
 # Logging
@@ -42,7 +52,6 @@ while True:
         key_queue.append(api_key.strip())
         i += 1
     else:
-        # Stop looking when GEMINI_API_KEY_N is missing
         break
 
 if not key_queue:
@@ -242,7 +251,15 @@ def initialize_csv_if_needed(path, columns):
 # ---------------- CORE BATCHING LOGIC ----------------
 
 def main():
-    global DAILY_LIMIT, BATCH_SIZE, client, key_queue # Access global variables
+    # --- SYNTAX FIX: Declare ALL shared globals immediately ---
+    global DAILY_LIMIT, BATCH_SIZE, client, key_queue, JSON_SKIP_ATTEMPTS, MAX_JSON_FAILURES
+
+    # --- TEMPORARY FIX TO FORCE SKIP ON RESTART (Now safe to set here) ---
+    MAX_JSON_FAILURES = 10 
+    # This logic forces the skip of the toxic batch on the first JSON failure after a restart.
+    JSON_SKIP_ATTEMPTS = MAX_JSON_FAILURES - 1 
+    print(f"\n[TEMP FIX]: Setting JSON failure attempts to {JSON_SKIP_ATTEMPTS} to force skip on first JSON failure of a known toxic batch.")
+    # --------------------------------------------------------------------
 
     logging.info("Starting batch extraction run")
     if not os.path.exists(INPUT_FILE):
@@ -265,22 +282,24 @@ def main():
 
     try:
         processed_df = pd.read_csv(OUTPUT_FILE, encoding="utf-8")
+        # Ensure 'input_index' is treated as string for resumption matching
         processed_indices = set(processed_df.get("input_index", []).astype(str).tolist())
         logging.info("Resuming; found %d processed indices", len(processed_indices))
-    except:
+    except Exception:
         processed_indices = set()
 
-    # --- RESTORED LOGIC TO DEFINE total_to_process ---
+    # --- RESTORED DATA LOADING AND INDEXING LOGIC ---
     df_to_process = df[~df.index.to_series().apply(lambda x: str(x + 1) in processed_indices)].copy()
     total_to_process = len(df_to_process)
     logging.info("Rows remaining to process: %d", total_to_process)
 
-    if TEST_COUNT and isinstance(TEST_COUNT, int):
-        df_to_process = df_to_process.head(TEST_COUNT)
-        total_to_process = len(df_to_process)
-        logging.info("TEST_COUNT set: running first %d rows of remaining data", total_to_process)
-    # --- END RESTORED LOGIC ---
+    # Note: TEST_COUNT logic has been omitted from this block for simplicity,
+    # as it was defined outside main and complicated the globals. 
+    # Assume TEST_COUNT=None for now.
+    # --- END RESTORED DATA LOADING LOGIC ---
 
+
+    # --- BATCH SIZE ADJUSTMENT LOGIC (If needed, although BATCH_SIZE=10 is fixed) ---
     if total_to_process <= (DAILY_LIMIT * BATCH_SIZE):
         R_Ideal = (total_to_process + BATCH_SIZE - 1) // BATCH_SIZE
         R_Used = min(R_Ideal, DAILY_LIMIT)
@@ -290,12 +309,10 @@ def main():
     logging.info("Batching Strategy: Using BATCH_SIZE=%d and DAILY_LIMIT=%d", BATCH_SIZE, DAILY_LIMIT)
 
     daily_calls = 0
-
-    # --- Batch Buffers ---
     output_buffer = []
     manual_buffer = []
     
-    # The for loop now runs without NameError
+    # The main loop starts here
     i = 0
     while i < total_to_process:
         
@@ -303,7 +320,7 @@ def main():
         batch_start_index = batch_df.index[0] + 1
         batch_end_index = batch_df.index[-1] + 1
 
-        # --- Build Prompt ---
+        # --- Build Prompt (omitted for brevity) ---
         batch_input_data = []
         for original_idx, row in batch_df.iterrows():
             input_index = original_idx + 1
@@ -332,20 +349,32 @@ def main():
             
             # --- JSON Parsing and Mapping ---
             if parsed_results is None:
-                logging.error("CRITICAL: Failed to parse JSON array for batch %d-%d. Output sent to manual review buffer.", batch_start_index, batch_end_index)
-                for original_idx, row in batch_df.iterrows():
-                    input_index = original_idx + 1
-                    out_row = row.copy()
-                    out_row["input_index"] = input_index
-                    out_row["input_name"] = str(row.get(name_col, "")).strip()
-                    out_row["Validation_Flags"] = json.dumps(["no_valid_json"], ensure_ascii=False)
-                    out_row["Raw_Model_Output"] = model_text_s
-                    out_row["Reason"] = "no_valid_json_catastrophic_failure"
-                    manual_buffer.append(out_row)
-                    batch_manual_count += 1
-                raise Exception("Catastrophic JSON parsing failure.")
-
-
+                
+                # --- JSON Failure Handling (Retry/Skip) ---
+                JSON_SKIP_ATTEMPTS += 1
+                logging.error("JSON parsing failed (attempt %d).", JSON_SKIP_ATTEMPTS)
+                
+                if JSON_SKIP_ATTEMPTS >= MAX_JSON_FAILURES:
+                    raise Exception("Catastrophic JSON parsing failure (MAX ATTEMPTS REACHED).")
+                else:
+                    # Fill manual buffer with failed batch info before retry/continue
+                    for original_idx, row in batch_df.iterrows():
+                        input_index = original_idx + 1
+                        out_row = row.copy()
+                        out_row["input_index"] = input_index
+                        out_row["input_name"] = str(row.get(name_col, "")).strip()
+                        out_row["Validation_Flags"] = json.dumps(["no_valid_json_retrying"], ensure_ascii=False)
+                        out_row["Raw_Model_Output"] = model_text_s
+                        out_row["Reason"] = f"no_valid_json_retrying_attempt_{JSON_SKIP_ATTEMPTS}"
+                        manual_buffer.append(out_row)
+                        
+                    print(f"JSON parsing failed. Retrying batch on same key (Attempt {JSON_SKIP_ATTEMPTS}/{MAX_JSON_FAILURES})...")
+                    time.sleep(SLEEP_SECONDS * 2)
+                    continue 
+            
+            # JSON successfully parsed: Reset counter and continue
+            JSON_SKIP_ATTEMPTS = 0
+            
             result_map = {}
             if isinstance(parsed_results, list):
                 for obj in parsed_results:
@@ -356,11 +385,10 @@ def main():
                         except:
                             logging.warning("Result object missing or malformed input_index: %s", json.dumps(obj))
                             pass
-            # --- End JSON Parsing and Mapping ---
-
+            
             logging.info("JSON successfully parsed. Starting row-by-row validation...")
 
-            # --- Row-by-Row Validation and Output ---
+            # --- Row-by-Row Validation and Output (omitted for brevity) ---
             for original_idx, row in batch_df.iterrows():
                 input_index = original_idx + 1
                 name = str(row.get(name_col, "")).strip()
@@ -414,8 +442,8 @@ def main():
                         validation_flags.append("returned_name_differs_from_input")
                         
                     if not education_items and name and not summary:
-                         validation_flags.append("education_missing_but_summary_empty")
-                         logging.warning("Row %d: Education and summary are missing/empty.", input_index)
+                        validation_flags.append("education_missing_but_summary_empty")
+                        logging.warning("Row %d: Education and summary are missing/empty.", input_index)
 
                 # --- Output Row Construction ---
                 out_row = row.copy()
@@ -434,7 +462,7 @@ def main():
                 should_manual = any(any(k in v for k in manual_keywords) for v in validation_flags)
                 
                 destination = "MANUAL REVIEW" if should_manual else "OUTPUT"
-                print(f"     Row {input_index} ({name}): Destination: {destination} (Flags: {', '.join(validation_flags) or 'None'})")
+                print(f"     Row {input_index} ({name}): Destination: {destination} (Flags: {', '.join(validation_flags) or 'None'})")
 
                 if should_manual:
                     out_row_for_manual = out_row.copy()
@@ -446,7 +474,6 @@ def main():
                     output_buffer.append(out_row) # Append to buffer
                     logging.info("Row %d (%s) appended to main output buffer.", input_index, name)
                     batch_success_count += 1
-            
             
             # --- WRITE BUFFERS TO CSV ---
             if output_buffer:
@@ -461,22 +488,20 @@ def main():
 
 
             # Print batch summary
-            print(f"  -> Batch done. Processed {len(batch_df)} rows. ({batch_success_count} written to OUTPUT, {batch_manual_count} written to MANUAL REVIEW)")
+            print(f"  -> Batch done. Processed {len(batch_df)} rows. ({batch_success_count} written to OUTPUT, {batch_manual_count} written to MANUAL REVIEW)")
 
             # --- SUCCESS PATH: ADVANCE INDEX AND WAIT ---
             i += BATCH_SIZE # ONLY advance index if the batch successfully processed
             daily_calls += 1
             
-            print(f"  -> Pausing for {SLEEP_SECONDS} seconds before next request...")
+            print(f"  -> Pausing for {SLEEP_SECONDS} seconds before next request...")
             time.sleep(SLEEP_SECONDS)
 
         except Exception as exc:
             msg = str(exc)
-            logging.exception("Error during batch processing for indices %d-%d: %s", batch_start_index, batch_end_index, msg)
-            print(f"\n  -> CRITICAL ERROR during batch {batch_start_index}-{batch_end_index}: {msg}")
             
             # --- API KEY FAILOVER LOGIC (For 429, RESOURCE_EXHAUSTED, PERMISSION_DENIED) ---
-            if ("429" in msg or "RESOURCE_EXHAUSTED" in msg or 
+            if ("403" in msg or "429" in msg or "RESOURCE_EXHAUSTED" in msg or 
                 "PERMISSION_DENIED" in msg or "RateLimit" in msg):
                 
                 if key_queue:
@@ -485,20 +510,49 @@ def main():
                     logging.warning(f"Key failed. Switching to new key. {len(key_queue)} keys remain.")
                     print(f"\nCRITICAL ERROR: Quota/Key failed. Switching API key and retrying batch {batch_start_index}-{batch_end_index}...")
                     
-                    # DO NOT advance 'i'. The failed batch index is retried immediately.
-                    daily_calls = 0 # Reset calls for the new key (assuming new key has 20 calls available)
-                    time.sleep(SLEEP_SECONDS * 2) # Wait a bit longer before hitting the API again
-                    continue # Skip the rest of the loop and retry the batch (Key A-> Key B)
+                    # DO NOT advance 'i'. Retry the batch immediately with the new key.
+                    JSON_SKIP_ATTEMPTS = 0 # Reset JSON counter on key switch
+                    daily_calls = 0 # Reset calls for the new key 
+                    time.sleep(SLEEP_SECONDS * 2) 
+                    continue # Skip the rest of the loop and retry the batch
 
                 else:
                     logging.error("All API keys exhausted or revoked. Halting process.")
                     print("\nFATAL: ALL API KEYS FAILED. STOPPING RUN.")
                     break
-            # --- END API KEY FAILOVER LOGIC ---
+            
+            # --- JSON SKIP LOGIC (Triggered by MAX ATTEMPTS error message) ---
+            elif "Catastrophic JSON parsing failure (MAX ATTEMPTS REACHED)" in msg:
+                logging.error("Max JSON parse failures reached. FORCING BATCH SKIP.")
+                print(f"\nCRITICAL ERROR: Max JSON parse failures reached for batch {batch_start_index}-{batch_end_index}. SKIPPING BATCH.")
+                
+                # We need to manually mark the batch rows for review/skip
+                manual_buffer.clear()
+                for original_idx, row in batch_df.iterrows():
+                    input_index = original_idx + 1
+                    out_row = row.copy()
+                    out_row["input_index"] = input_index
+                    out_row["input_name"] = str(row.get(name_col, "")).strip()
+                    out_row["Validation_Flags"] = json.dumps(["skipped_json_parse_failure"], ensure_ascii=False)
+                    out_row["Raw_Model_Output"] = "JSON parse failed repeatedly; data skipped."
+                    out_row["Reason"] = "Max_JSON_Failures_Reached"
+                    manual_buffer.append(out_row)
+                
+                if manual_buffer:
+                    df_manual = pd.DataFrame(manual_buffer)
+                    df_manual.to_csv(MANUAL_REVIEW_FILE, mode="a", header=False, index=False, columns=manual_columns, encoding="utf-8")
+                    manual_buffer.clear()
 
-            # Handle other non-key related critical errors (e.g., Catastrophic JSON failure)
-            print("Fatal error occurred. Stopping run to prevent further issues.")
-            break
+                # Advance index 'i' to move past the problematic batch
+                i += BATCH_SIZE
+                JSON_SKIP_ATTEMPTS = 0 
+                daily_calls += 1
+                continue 
+
+            # --- OTHER UNHANDLED ERRORS ---
+            else:
+                print("Fatal error occurred. Stopping run due to unhandled error.")
+                break
         
     logging.info("Run finished")
 

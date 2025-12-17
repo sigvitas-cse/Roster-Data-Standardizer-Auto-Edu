@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-education_extraction_structured.py
+education_extraction_batch_final.py
 
-Reads input_data.xlsx and queries Gemini (via google.genai client + GoogleSearch tool)
-to fetch structured education histories. Saves results to education_output.csv.
+Robust structured education extraction for people in input_data.xlsx using google.genai
+with GoogleSearch tool. Uses PROMPT-BASED JSON OUTPUT (since tool use conflicts with schema).
 
-Key features:
-- Strict JSON output requested from the model (education entries + sources).
-- Validates graduation years and flags improbable years.
-- Resumes from existing CSV.
-- Handles 429 by stopping gracefully so you can re-run next day.
+- Implements batch processing, buffering, and robust manual JSON cleanup.
+- Requires: google-genai, requests, pandas, tenacity, python-dotenv
+- Set GEMINI_API_KEY in environment (or .env).
 """
 
 import os
+import re
 import time
 import json
 import logging
@@ -20,21 +19,27 @@ from datetime import datetime
 from dotenv import load_dotenv
 import pandas as pd
 import tenacity
+import requests
 from google import genai
 from google.genai import types
 
-# ------------ CONFIG --------------
+# ---------------- CONFIG ----------------
 INPUT_FILE = "input_data.xlsx"
 OUTPUT_FILE = "education_output.csv"
-LOG_FILE = "education_extraction_structured.log"
+MANUAL_REVIEW_FILE = "manual_review.csv"
+RESOLVED_URLS_FILE = "resolved_urls.csv"
+LOG_FILE = "education_extraction_batch.log"
 
-MODEL = "gemini-2.5-flash"   # keep your model choice; change to '-pro' if available/preferred
-SLEEP_SECONDS = 4
+MODEL = "gemini-2.5-flash"
+SLEEP_SECONDS = 15      # Time to wait BETWEEN BATCHES (to respect RPM limit)
 RETRY_ATTEMPTS = 3
-BATCH_SIZE = 1               # keep 1 for maximum accuracy; increase to group multiple names per call
-DAILY_LIMIT = 250
-# ----------------------------------
+DAILY_LIMIT = 20        # Max Requests Per Day (RPD)
+BATCH_SIZE = 10         # Max rows per request
+TEST_COUNT = None       # change to None to run all rows
 
+# ----------------------------------------
+
+# Logging
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 load_dotenv()
 api_key = os.environ.get("GEMINI_API_KEY")
@@ -44,40 +49,40 @@ if not api_key:
 client = genai.Client(api_key=api_key)
 current_year = datetime.now().year
 
+# Strict prompt (RESTORED TO DETAILED JSON INSTRUCTIONS)
 PROMPT_TEMPLATE = """
-You are a careful researcher. For each person provided, find authoritative public sources (law firm bio, university page, company profile, official directory, or LinkedIn) and extract a complete education history.
+You are a careful, literal data researcher. For the list of people below, find authoritative public sources
+(law firm bio, company bio, university profile, LinkedIn profile, or official directories) and extract
+a complete education history for **each person**.
 
-**INPUT**:
-Name: {name}
-Organization: {org}
-Location: {city}, {state}
-
-**OUTPUT (STRICT JSON ONLY)**:
-Return a JSON array (no surrounding text). Each array item must be an object with:
-{{
-  "input_index": <integer>,
-  "input_name": "<original name>",
+**IMPORTANT RULES (read and obey):**
+1. Use EXACT input_index provided for each result. **Do not renumber** results.
+2. Return STRICT JSON ONLY (no commentary) — a JSON array of objects (one object per input row).
+3. The JSON array must contain exactly one object for every input item provided in the INPUT_DATA section.
+4. Each object must be:
+{
+  "input_index": <integer, must match input>,
+  "input_name": "<original name from input>",
   "education": [
-    {{
+    {
       "degree": "<e.g., J.D., LL.M., B.S., M.S., Ph.D.>",
-      "field": "<field or major if available, else empty>",
-      "institution": "<full name>",
-      "graduation_year": "<YYYY or empty string>",
-      "notes": "<honors, thesis, or extra details>",
-      "source": "<authoritative URL or empty>"
-    }},
+      "field": "<field/major or empty>",
+      "institution": "<full institution name>",
+      "graduation_year": "<YYYY or empty>",
+      "notes": "<honors/in progress/other or empty>",
+      "source": "<canonical URL to the authoritative source or empty>"
+    },
     ...
   ],
-  "best_summary": "<one-sentence human summary>",
-  "sources": ["<list of URLs used>"]
-}}
+  "best_summary": "<one-sentence summary or 'No verified education info found'>",
+  "sources": ["<canonical URLs used>"]
+}
 
-Rules:
-- If you find nothing, return the object with "education": [] and "sources": [] and best_summary "No education info found".
-- Always include at least one source per education item when possible.
-- Use exact institution names and degree labels as shown on the sources.
-- Do NOT invent degrees or years. If uncertain, leave year blank and include the source.
-- Output must be valid JSON only (an array of objects). Number objects using input_index you will supply.
+5. **Do NOT invent degrees or years.** If a degree is in progress, set graduation_year to "" and notes to "in progress/expected - cite source".
+6. Return canonical page URLs (the real page URL).
+7. If you cannot find authoritative sources for a person, set their "education": [], "sources": [], and "best_summary": "No verified education info found".
+
+INPUT_DATA (List of people to process):
 """
 
 @tenacity.retry(
@@ -86,87 +91,128 @@ Rules:
     retry=tenacity.retry_if_exception_type(Exception),
     reraise=True
 )
-def call_model_with_search(prompt_text: str):
-    response = client.models.generate_content(
+def call_model(prompt_text: str):
+    resp = client.models.generate_content(
         model=MODEL,
         contents=prompt_text,
         config=types.GenerateContentConfig(
+            # --- JSON SCHEMA CONFIG REMOVED DUE TO TOOL CONFLICT ---
             tools=[types.Tool(google_search=types.GoogleSearch())],
             response_modalities=["TEXT"]
         )
     )
-    text = getattr(response, "text", None)
+    text = getattr(resp, "text", None)
     if text is None:
-        # fallback to string conversion
-        text = str(response)
+        text = str(resp)
     return text
 
-def extract_json(text: str):
-    """Find first JSON array in the text and parse it."""
-    start = text.find('[')
-    end = text.rfind(']')
+def sanitize_model_text(text: str) -> str:
+    """Removes code fences and unescape common escapes so JSON can be found."""
+    if not isinstance(text, str):
+        return ""
+    t = text.strip()
+    if t.startswith("```"):
+        parts = t.split("\n")
+        if len(parts) >= 2:
+            parts = parts[1:]
+            if parts and parts[-1].strip().startswith("```"):
+                parts = parts[:-1]
+            t = "\n".join(parts).strip()
+    t = t.replace('\\"', '"')
+    t = t.replace('“', '"').replace('”', '"').replace("’", "'")
+    return t
+
+def extract_json_array(text: str):
+    """
+    Extracts first JSON array substring and parses it. 
+    This function must be robust since we are using prompt-based JSON output.
+    """
+    t = sanitize_model_text(text)
+    start = t.find('[')
+    end = t.rfind(']')
     if start == -1 or end == -1 or end <= start:
         return None
-    json_str = text[start:end+1]
-    # common cleanup
-    json_str = json_str.replace('“', '"').replace('”', '"').replace("’", "'")
-    json_str = json_str.replace('\n', ' ')
-    json_str = json_str.replace(', }', ' }').replace(', ]', ' ]')
+    json_blob = t[start:end+1]
+    
+    # Fix trailing commas, a critical step for prompt-based JSON output
+    json_blob = re.sub(r',\s*([\]\}])', r'\1', json_blob)
+    
     try:
-        return json.loads(json_str)
+        parsed = json.loads(json_blob)
+        return parsed
     except Exception as e:
-        logging.exception(f"JSON parse error: {e}")
+        logging.error("--- RAW MODEL OUTPUT THAT FAILED PARSING ---")
+        logging.error(t)
+        logging.error("-------------------------------------------")
+        logging.exception("JSON parsing failed: %s", e)
         return None
 
-def validate_education_entries(ed_list):
-    """Validate years and flag improbable years. Return cleaned list and list of flags."""
-    flags = []
-    cleaned = []
-    for entry in ed_list:
-        # Ensure required keys exist
-        degree = entry.get("degree", "") if isinstance(entry, dict) else ""
-        field = entry.get("field", "") if isinstance(entry, dict) else ""
-        institution = entry.get("institution", "") if isinstance(entry, dict) else ""
-        year_raw = entry.get("graduation_year", "") if isinstance(entry, dict) else ""
-        notes = entry.get("notes", "") if isinstance(entry, dict) else ""
-        source = entry.get("source", "") if isinstance(entry, dict) else ""
+def resolve_url(url: str, timeout=10):
+    """Follow redirects and return (resolved_url, status_code). If error, return (original, None)."""
+    try:
+        cleaned = str(url).strip()
+        tokens = cleaned.split()
+        candidate = None
+        for tok in tokens[::-1]:
+            if tok.lower().startswith("http"):
+                candidate = tok
+                break
+        if candidate is None:
+            candidate = tokens[0]
+        r = requests.get(candidate, timeout=timeout, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+        return r.url, r.status_code
+    except Exception as e:
+        logging.warning("resolve_url error for %s: %s", url, str(e))
+        return url, None
 
-        # normalize year to 4-digit if possible
+def validate_education_items(items):
+    """
+    items: list of dicts from model 'education' field.
+    Returns (cleaned_items, flags) where cleaned_items are normalized and flags list issues.
+    """
+    cleaned = []
+    flags = []
+    for ent in (items or []):
+        if not isinstance(ent, dict):
+            flags.append("malformed_education_entry")
+            continue
+        degree = ent.get("degree", "") or ""
+        field = ent.get("field", "") or ""
+        institution = ent.get("institution", "") or ""
+        grad_raw = ent.get("graduation_year", "") or ""
+        notes = ent.get("notes", "") or ""
+        source = ent.get("source", "") or ""
+
         year = ""
-        if isinstance(year_raw, int):
-            year = str(year_raw)
-        elif isinstance(year_raw, str) and year_raw.strip().isdigit():
-            year = year_raw.strip()
-        elif isinstance(year_raw, str):
-            # try to extract 4-digit number
-            import re
-            m = re.search(r'(19|20)\d{2}', year_raw)
+        if isinstance(grad_raw, int):
+            year = str(grad_raw)
+        elif isinstance(grad_raw, str):
+            m = re.search(r'(19|20)\d{2}', grad_raw)
             if m:
                 year = m.group(0)
 
-        # flag improbable years
         if year:
             try:
                 y = int(year)
                 if y > current_year:
-                    flags.append(f"graduation_year_in_future:{year} for institution {institution}")
-                elif y < 1900:
-                    flags.append(f"graduation_year_too_old:{year} for institution {institution}")
-            except Exception:
+                    flags.append(f"graduation_year_in_future:{year} for {institution}")
+            except:
                 pass
 
+        if degree and not source:
+            flags.append("degree_without_source")
+
         cleaned.append({
-            "degree": degree or "",
-            "field": field or "",
-            "institution": institution or "",
+            "degree": degree.strip(),
+            "field": field.strip(),
+            "institution": institution.strip(),
             "graduation_year": year,
-            "notes": notes or "",
-            "source": source or ""
+            "notes": notes.strip(),
+            "source": source.strip()
         })
     return cleaned, flags
 
-def find_name_column(df: pd.DataFrame):
-    # prefer exact 'Name', fallback to any header containing 'name'
+def find_name_column(df):
     if "Name" in df.columns:
         return "Name"
     for c in df.columns:
@@ -174,154 +220,271 @@ def find_name_column(df: pd.DataFrame):
             return c
     return df.columns[0]
 
+def append_row_to_csv(path, row_dict, columns):
+    """Writes a single row (dict) to CSV, appending without header."""
+    df = pd.DataFrame([row_dict])
+    df.to_csv(path, mode="a", header=False, index=False, columns=columns, encoding="utf-8")
+
+def initialize_csv_if_needed(path, columns):
+    """Creates the CSV file with headers if it doesn't exist."""
+    if not os.path.exists(path):
+        pd.DataFrame(columns=columns).to_csv(path, index=False, encoding="utf-8")
+
+# ---------------- CORE BATCHING LOGIC ----------------
+
 def main():
-    logging.info("Starting structured education extraction run")
+    global DAILY_LIMIT, BATCH_SIZE
+
+    logging.info("Starting batch extraction run")
     if not os.path.exists(INPUT_FILE):
-        raise SystemExit(f"Input file not found: {INPUT_FILE}")
+        logging.error("Input file missing: %s", INPUT_FILE)
+        raise SystemExit("Input file not found")
 
     df = pd.read_excel(INPUT_FILE, engine="openpyxl")
     name_col = find_name_column(df)
     total_rows = len(df)
-    logging.info(f"Loaded {total_rows} rows. Using name column '{name_col}'")
+    logging.info("Loaded %d rows; using name column: %s", total_rows, name_col)
 
-    # prepare output CSV (resume if exists)
-    processed_names = set()
-    if os.path.exists(OUTPUT_FILE):
-        try:
-            existing = pd.read_csv(OUTPUT_FILE)
-            if "input_name" in existing.columns:
-                processed_names = set(existing["input_name"].astype(str).tolist())
-            logging.info(f"Resuming; found {len(processed_names)} already-processed names")
-            out_handle = open(OUTPUT_FILE, "a", encoding="utf-8", newline="")
-            append_header = False
-        except Exception:
-            # fallback: create new
-            processed_names = set()
-            append_header = True
-            out_handle = open(OUTPUT_FILE, "w", encoding="utf-8", newline="")
-    else:
-        out_handle = open(OUTPUT_FILE, "w", encoding="utf-8", newline="")
-        append_header = True
+    csv_columns = list(df.columns) + ["input_index", "input_name", "Education_JSON",
+                                     "Education_Summary", "Education_Sources",
+                                     "Validation_Flags", "Raw_Model_Output"]
+    initialize_csv_if_needed(OUTPUT_FILE, csv_columns)
 
-    cols_for_csv = list(df.columns) + ["input_index", "input_name", "Education_JSON", "Education_Summary", "Education_Sources", "Validation_Flags", "Raw_Model_Output"]
-    # write header if needed
-    if append_header:
-        pd.DataFrame(columns=cols_for_csv).to_csv(out_handle, index=False)
-    out_handle.close()
+    manual_columns = csv_columns + ["Reason"]
+    initialize_csv_if_needed(MANUAL_REVIEW_FILE, manual_columns)
+    initialize_csv_if_needed(RESOLVED_URLS_FILE, ["original_url", "resolved_url", "status_code"])
+
+    try:
+        processed_df = pd.read_csv(OUTPUT_FILE, encoding="utf-8")
+        processed_indices = set(processed_df.get("input_index", []).astype(str).tolist())
+        logging.info("Resuming; found %d processed indices", len(processed_indices))
+    except:
+        processed_indices = set()
+
+    # --- RESTORED LOGIC TO DEFINE total_to_process ---
+    df_to_process = df[~df.index.to_series().apply(lambda x: str(x + 1) in processed_indices)].copy()
+    total_to_process = len(df_to_process)
+    logging.info("Rows remaining to process: %d", total_to_process)
+
+    if TEST_COUNT and isinstance(TEST_COUNT, int):
+        df_to_process = df_to_process.head(TEST_COUNT)
+        total_to_process = len(df_to_process)
+        logging.info("TEST_COUNT set: running first %d rows of remaining data", total_to_process)
+    # --- END RESTORED LOGIC ---
+
+    if total_to_process <= (DAILY_LIMIT * BATCH_SIZE):
+        R_Ideal = (total_to_process + BATCH_SIZE - 1) // BATCH_SIZE
+        R_Used = min(R_Ideal, DAILY_LIMIT)
+        BATCH_SIZE = (total_to_process + R_Used - 1) // R_Used
+        DAILY_LIMIT = R_Used
+
+    logging.info("Batching Strategy: Using BATCH_SIZE=%d and DAILY_LIMIT=%d", BATCH_SIZE, DAILY_LIMIT)
 
     daily_calls = 0
-    results = []
-    for i, row in df.iterrows():
+
+    # --- Batch Buffers ---
+    output_buffer = []
+    manual_buffer = []
+    
+    # The for loop now runs without NameError
+    for i in range(0, total_to_process, BATCH_SIZE):
+        
         if daily_calls >= DAILY_LIMIT:
-            logging.warning("Reached daily API call limit; stopping run")
-            print(f"Reached daily limit ({DAILY_LIMIT}). Stopping.")
+            logging.warning("Reached daily limit; stopping")
+            print(f"\nReached daily limit ({DAILY_LIMIT} requests). Stop and resume later.")
             break
+        
+        batch_df = df_to_process.iloc[i:i + BATCH_SIZE]
+        batch_start_index = batch_df.index[0] + 1
+        batch_end_index = batch_df.index[-1] + 1
 
-        raw_name = row.get(name_col, "")
-        if pd.isna(raw_name) or str(raw_name).strip() == "":
-            continue
-        name = str(raw_name).strip()
-        if name in processed_names:
-            logging.info(f"Skipping {name} (already done)")
-            continue
+        batch_input_data = []
+        for original_idx, row in batch_df.iterrows():
+            input_index = original_idx + 1
+            name = str(row.get(name_col, "")).strip()
+            org = str(row.get("Organization/Law Firm Name", "") or "").strip()
+            city = str(row.get("City", "") or "").strip()
+            state = str(row.get("State", "") or "").strip()
 
-        org = row.get("Organization/Law Firm Name", "")
-        city = row.get("City", "")
-        state = row.get("State", "")
+            batch_input_data.append(
+                f"[{input_index}] Name: {name} | Organization: {org} | Location: {city}, {state}"
+            )
 
-        input_index = i + 1
-        prompt = PROMPT_TEMPLATE.format(name=name, org=org or "", city=city or "", state=state or "")
+        prompt = PROMPT_TEMPLATE + "\n" + "\n".join(batch_input_data) + "\n\nReturn JSON now."
 
-        print(f"[{input_index}/{total_rows}] Querying: {name}")
+        print(f"\n[Request {daily_calls + 1}/{DAILY_LIMIT}] Processing batch {batch_start_index}-{batch_end_index} ({len(batch_df)} rows)...")
+
+        
+        batch_success_count = 0
+        batch_manual_count = 0
+        
+        # Clear buffers for the new batch
+        output_buffer.clear()
+        manual_buffer.clear() 
+
         try:
-            model_text = call_model_with_search(prompt)
-            parsed = extract_json(model_text)
-            validation_flags = []
-            education_json = []
-            summary = ""
-            sources_list = []
+            logging.info("Calling model for batch: %d to %d", batch_start_index, batch_end_index)
+            model_text = call_model(prompt)
+            model_text_s = sanitize_model_text(model_text)
+            parsed_results = extract_json_array(model_text_s)
+            
+            if parsed_results is None:
+                # Catastrophic JSON failure logic: write rows to manual review buffer
+                logging.error("CRITICAL: Failed to parse JSON array for batch %d-%d. Output sent to manual review buffer.", batch_start_index, batch_end_index)
+                for original_idx, row in batch_df.iterrows():
+                    input_index = original_idx + 1
+                    out_row = row.copy()
+                    out_row["input_index"] = input_index
+                    out_row["input_name"] = str(row.get(name_col, "")).strip()
+                    out_row["Validation_Flags"] = json.dumps(["no_valid_json"], ensure_ascii=False)
+                    out_row["Raw_Model_Output"] = model_text_s
+                    out_row["Reason"] = "no_valid_json_catastrophic_failure"
+                    manual_buffer.append(out_row) # Add to buffer
+                    batch_manual_count += 1
+                raise Exception("Catastrophic JSON parsing failure.")
 
-            if parsed is None:
-                # fallback: save raw model text for inspection
-                logging.warning(f"No JSON returned for {name}. Saving raw text.")
-                education_json = []
+
+            result_map = {}
+            if isinstance(parsed_results, list):
+                for obj in parsed_results:
+                    if isinstance(obj, dict):
+                        try:
+                            idx = int(obj.get("input_index", 0))
+                            result_map[idx] = obj
+                        except:
+                            logging.warning("Result object missing or malformed input_index: %s", json.dumps(obj))
+                            pass
+            
+            logging.info("JSON successfully parsed. Starting row-by-row validation...")
+
+            for original_idx, row in batch_df.iterrows():
+                input_index = original_idx + 1
+                name = str(row.get(name_col, "")).strip()
+                matched = result_map.get(input_index)
+
+                validation_flags = []
+                education_items = []
                 summary = ""
                 sources_list = []
-                validation_flags.append("no_valid_json")
-            else:
-                # parsed is expected to be an array; find object matching input_index
-                matched_obj = None
-                if isinstance(parsed, list):
-                    # try match by input_index first
-                    for obj in parsed:
-                        try:
-                            if int(obj.get("input_index", -1)) == input_index:
-                                matched_obj = obj
-                                break
-                        except Exception:
-                            pass
-                    # fallback: match by name (case-insensitive)
-                    if matched_obj is None:
-                        for obj in parsed:
-                            if isinstance(obj, dict) and obj.get("input_name", "").strip().lower() == name.lower():
-                                matched_obj = obj
-                                break
-                    # fallback: if only one object returned for this batch, use it
-                    if matched_obj is None and len(parsed) == 1:
-                        matched_obj = parsed[0]
-
-                if matched_obj is None:
-                    logging.warning(f"No matching object for {name} in model JSON")
-                    validation_flags.append("no_matching_object_in_json")
-                    education_json = []
-                    summary = ""
-                    sources_list = []
+                
+                # --- START ROW PROCESSING ---
+                
+                if matched is None:
+                    validation_flags.append("no_matching_object_in_batch_json")
+                    summary = "No verified education info found"
+                    logging.info("Row %d (%s) failed to match index in JSON.", input_index, name)
                 else:
-                    raw_ed = matched_obj.get("education", [])
-                    cleaned_ed, flags = validate_education_entries(raw_ed)
-                    education_json = cleaned_ed
+                    raw_edu = matched.get("education", []) if isinstance(matched, dict) else []
+                    summary = matched.get("best_summary", "") or ""
+                    sources_list_raw = matched.get("sources", []) or []
+
+                    cleaned_ed, flags = validate_education_items(raw_edu)
                     validation_flags.extend(flags)
-                    summary = matched_obj.get("best_summary", "") or ""
-                    sources_list = matched_obj.get("sources", []) or []
 
-            # prepare row to append
-            out_row = row.copy()
-            out_row["input_index"] = input_index
-            out_row["input_name"] = name
-            out_row["Education_JSON"] = json.dumps(education_json, ensure_ascii=False)
-            out_row["Education_Summary"] = summary
-            out_row["Education_Sources"] = json.dumps(sources_list, ensure_ascii=False)
-            out_row["Validation_Flags"] = json.dumps(validation_flags, ensure_ascii=False)
-            out_row["Raw_Model_Output"] = model_text if model_text else ""
+                    # --- Source Resolution ---
+                    resolved_sources_list = []
+                    for s in sources_list_raw:
+                        resolved_url, status = resolve_url(s)
+                        resolved_sources_list.append(resolved_url)
+                        append_row_to_csv(RESOLVED_URLS_FILE, {"original_url": s, "resolved_url": resolved_url, "status_code": status}, ["original_url", "resolved_url", "status_code"])
 
-            # append to CSV incrementally
-            pd.DataFrame([out_row]).to_csv(OUTPUT_FILE, mode="a", header=False, index=False)
-            processed_names.add(name)
+                    for e in cleaned_ed:
+                        s = e.get("source", "")
+                        if s:
+                            resolved_url, status = resolve_url(s)
+                            e["resolved_source"] = resolved_url
+                            append_row_to_csv(RESOLVED_URLS_FILE, {"original_url": s, "resolved_url": resolved_url, "status_code": status}, ["original_url", "resolved_url", "status_code"])
+                        else:
+                            e["resolved_source"] = ""
+                            validation_flags.append("education_item_missing_source")
+                    # --- END Source Resolution ---
+
+                    education_items = cleaned_ed
+                    sources_list = resolved_sources_list
+
+                    if not education_items:
+                        summary = "No verified education info found"
+                        sources_list = []
+                        validation_flags.append("no_education_found")
+
+                    returned_name = matched.get("input_name", "").strip() if isinstance(matched, dict) else ""
+                    if returned_name and returned_name.lower() != name.lower():
+                        validation_flags.append("returned_name_differs_from_input")
+                        
+                    if not education_items and name and not summary:
+                         validation_flags.append("education_missing_but_summary_empty")
+                         logging.warning("Row %d: Education and summary are missing/empty.", input_index)
+
+                # --- Output Row Construction ---
+                out_row = row.copy()
+                out_row["input_index"] = input_index
+                out_row["input_name"] = name
+                out_row["Education_JSON"] = json.dumps(education_items, ensure_ascii=False)
+                out_row["Education_Summary"] = summary
+                out_row["Education_Sources"] = json.dumps(sources_list, ensure_ascii=False)
+                out_row["Validation_Flags"] = json.dumps(validation_flags, ensure_ascii=False)
+                out_row["Raw_Model_Output"] = model_text_s if (matched is None or validation_flags) else ""
+
+                manual_keywords = {"no_valid_json", "no_matching_object_in_batch_json",
+                                 "graduation_year_in_future", "degree_without_source",
+                                 "no_resolved_authoritative_source", "education_missing_but_summary_empty"}
+
+                should_manual = any(any(k in v for k in manual_keywords) for v in validation_flags)
+                
+                destination = "MANUAL REVIEW" if should_manual else "OUTPUT"
+                print(f"     Row {input_index} ({name}): Destination: {destination} (Flags: {', '.join(validation_flags) or 'None'})")
+
+                if should_manual:
+                    out_row_for_manual = out_row.copy()
+                    out_row_for_manual["Reason"] = ";".join(validation_flags) if validation_flags else "other"
+                    manual_buffer.append(out_row_for_manual) # Append to buffer
+                    logging.info("Row %d (%s) appended to manual review buffer.", input_index, name)
+                    batch_manual_count += 1
+                else:
+                    output_buffer.append(out_row) # Append to buffer
+                    logging.info("Row %d (%s) appended to main output buffer.", input_index, name)
+                    batch_success_count += 1
+            
+            
+            # --- WRITE BUFFERS TO CSV ---
+            if output_buffer:
+                df_out = pd.DataFrame(output_buffer)
+                # Use to_csv append mode, but without writing headers every time
+                df_out.to_csv(OUTPUT_FILE, mode="a", header=False, index=False, columns=csv_columns, encoding="utf-8")
+                logging.info("Wrote %d rows to main output file.", len(output_buffer))
+
+            if manual_buffer:
+                df_manual = pd.DataFrame(manual_buffer)
+                df_manual.to_csv(MANUAL_REVIEW_FILE, mode="a", header=False, index=False, columns=manual_columns, encoding="utf-8")
+                logging.info("Wrote %d rows to manual review file.", len(manual_buffer))
+
+
+            # Print batch summary
+            print(f"  -> Batch done. Processed {len(batch_df)} rows. ({batch_success_count} written to OUTPUT, {batch_manual_count} written to MANUAL REVIEW)")
+
             daily_calls += 1
-            time.sleep(SLEEP_SECONDS)
-            print(f"  -> Saved (flags: {validation_flags})")
+            if daily_calls < DAILY_LIMIT:
+                print(f"  -> Pausing for {SLEEP_SECONDS} seconds before next request...")
+                time.sleep(SLEEP_SECONDS)
 
         except Exception as exc:
             msg = str(exc)
-            logging.exception(f"Error querying {name}: {msg}")
-            print(f"  -> Error: {msg}")
-            # if rate-limit style error, stop so you can resume next day
+            logging.exception("Error during batch processing for indices %d-%d: %s", batch_start_index, batch_end_index, msg)
+            print(f"\n  -> CRITICAL ERROR during batch {batch_start_index}-{batch_end_index}: {msg}")
+            
             if "429" in msg or "Resource exhausted" in msg or "RateLimit" in msg:
-                print("Rate limit / resource exhausted detected. Exiting to allow resume later.")
+                delay_match = re.search(r"Please retry in (\d+\.?\d*)s", msg, re.IGNORECASE)
+                wait_time = float(delay_match.group(1)) + 1.0 if delay_match else SLEEP_SECONDS * 2
+                
+                logging.warning("Rate limit detected. Pausing for %s seconds and stopping run.", wait_time)
+                print(f"Rate limit detected. Waiting for {wait_time:.1f} seconds. Stopping run to comply.")
+                time.sleep(wait_time)
                 break
-            # otherwise save an error row
-            out_row = row.copy()
-            out_row["input_index"] = input_index
-            out_row["input_name"] = name
-            out_row["Education_JSON"] = json.dumps([], ensure_ascii=False)
-            out_row["Education_Summary"] = ""
-            out_row["Education_Sources"] = json.dumps([], ensure_ascii=False)
-            out_row["Validation_Flags"] = json.dumps([f"exception:{msg}"], ensure_ascii=False)
-            out_row["Raw_Model_Output"] = f"ERROR: {msg}"
-            pd.DataFrame([out_row]).to_csv(OUTPUT_FILE, mode="a", header=False, index=False)
-            # continue to next row (or break if you prefer)
-
-    logging.info("Extraction run finished")
+            
+            print("Fatal error occurred. Stopping run to prevent further issues.")
+            break
+        
+    logging.info("Run finished")
 
 if __name__ == "__main__":
     main()
